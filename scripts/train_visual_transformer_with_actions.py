@@ -89,7 +89,7 @@ def _collator_with_actions(
         return {
             "input_ids": torch.tensor(batch["input_ids"], dtype=torch.long),
             "labels": torch.tensor(batch["labels"], dtype=torch.long),
-            "map_canvas": torch.tensor(batch["map_canvas"], dtype=torch.long),
+            "visual_maps": torch.tensor(batch["visual_maps"], dtype=torch.long),
             "event_positions": torch.tensor(batch["event_positions"], dtype=torch.long),
             "event_counts": torch.tensor(batch["event_counts"], dtype=torch.long),
             "act_mask": torch.tensor(batch["act_mask"], dtype=torch.bool),
@@ -155,13 +155,13 @@ def train_epoch(model, dataloader, optimizer, device, grad_clip=1.0):
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
-        map_canvas = batch["map_canvas"].to(device)
+        visual_maps = batch["visual_maps"].to(device)
         event_positions = batch["event_positions"].to(device)
         event_counts = batch["event_counts"].to(device)
         act_mask = batch["act_mask"].to(device)
         pos_mask = batch["pos_mask"].to(device)
 
-        logits = model(input_ids, visual_maps=map_canvas, event_positions=event_positions, event_counts=event_counts)
+        logits = model(input_ids, visual_maps=visual_maps, event_positions=event_positions, event_counts=event_counts)
         
         # Compute losses with breakdown
         losses = compute_losses_by_type(logits, labels, act_mask, pos_mask)
@@ -200,13 +200,13 @@ def evaluate_model(model, dataloader, device):
         for batch in dataloader:
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
-            map_canvas = batch["map_canvas"].to(device)
+            visual_maps = batch["visual_maps"].to(device)
             event_positions = batch["event_positions"].to(device)
             event_counts = batch["event_counts"].to(device)
             act_mask = batch["act_mask"].to(device)
             pos_mask = batch["pos_mask"].to(device)
 
-            logits = model(input_ids, visual_maps=map_canvas, event_positions=event_positions, event_counts=event_counts)
+            logits = model(input_ids, visual_maps=visual_maps, event_positions=event_positions, event_counts=event_counts)
             
             # Compute losses with breakdown
             losses = compute_losses_by_type(logits, labels, act_mask, pos_mask)

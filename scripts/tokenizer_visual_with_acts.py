@@ -13,6 +13,8 @@ from agimaze_predict.baselines.visual_transformer.tokenizer import (
     SerializedVisualExample,
     IGNORE_INDEX,
     PAD_TOKEN_ID,
+    _canvas,
+    BYTE_VOCAB_SIZE,
 )
 
 
@@ -129,18 +131,11 @@ def collate_visual_examples_with_actions(
         act_masks.append(row_act_mask)
         pos_masks.append(row_pos_mask)
 
-    # Pad visual canvases
-    map_canvas: list[list[list[int]]] = []
+    # Build visual canvases using original _canvas function
+    visual_maps: list[list[list[int]]] = []
     for item in serialized:
-        rows = list(item.map_rows)
-        # Pad to canvas dimensions
-        while len(rows) < canvas_height:
-            rows.append("")
-        canvas = []
-        for row in rows[:canvas_height]:
-            padded = (row + " " * canvas_width)[:canvas_width]
-            canvas.append([ord(c) for c in padded])
-        map_canvas.append(canvas)
+        canvas = _canvas(item.map_rows, height=canvas_height, width=canvas_width, blank_char=ord(" "))
+        visual_maps.append(canvas)
 
     # Pad event positions and compute event counts
     max_events = max(len(item.event_positions) for item in serialized)
@@ -160,7 +155,7 @@ def collate_visual_examples_with_actions(
     return {
         "input_ids": input_ids,
         "labels": labels,
-        "map_canvas": map_canvas,
+        "visual_maps": visual_maps,
         "event_positions": event_positions,
         "event_counts": event_counts,
         "act_mask": act_masks,
