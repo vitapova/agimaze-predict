@@ -92,6 +92,8 @@ def _collator_with_actions(
             "visual_maps": torch.tensor(batch["visual_maps"], dtype=torch.long),
             "event_positions": torch.tensor(batch["event_positions"], dtype=torch.long),
             "event_counts": torch.tensor(batch["event_counts"], dtype=torch.long),
+            "target_input_ids": torch.tensor(batch["target_input_ids"], dtype=torch.long),
+            "target_labels": torch.tensor(batch["target_labels"], dtype=torch.long),
             "act_mask": torch.tensor(batch["act_mask"], dtype=torch.bool),
             "pos_mask": torch.tensor(batch["pos_mask"], dtype=torch.bool),
         }
@@ -116,18 +118,33 @@ def make_dataloader(
     )
 
 
-def compute_losses_by_type(logits, labels, act_mask, pos_mask):
-    """Compute separate losses for ACT and POS tokens."""
+def compute_losses_by_type(logits, labels, act_mask, pos_mask, pos_readout="full_text"):
+    """Compute separate losses for ACT and POS tokens.
+    
+    For visual_only mode, act_mask/pos_mask don't apply to target_labels,
+    so we return 0 for ACT loss and full loss for POS.
+    """
     # Total loss
     total_loss = target_cross_entropy(logits, labels)
+    total_bytes = labels.ne(-100).sum().item()
     
-    # ACT loss
+    if pos_readout == "visual_only":
+        # Target sequence contains only POS, no ACT breakdown possible
+        return {
+            "total_loss": total_loss,
+            "act_loss": torch.tensor(0.0, device=logits.device),
+            "pos_loss": total_loss,
+            "act_bytes": 0,
+            "pos_bytes": total_bytes,
+            "total_bytes": total_bytes,
+        }
+    
+    # Full text mode: compute ACT/POS breakdown
     act_labels = labels.clone()
     act_labels[~act_mask] = -100
     act_loss = target_cross_entropy(logits, act_labels)
     act_bytes = act_mask.sum().item()
     
-    # POS loss
     pos_labels = labels.clone()
     pos_labels[~pos_mask] = -100
     pos_loss = target_cross_entropy(logits, pos_labels)
@@ -143,7 +160,7 @@ def compute_losses_by_type(logits, labels, act_mask, pos_mask):
     }
 
 
-def train_epoch(model, dataloader, optimizer, device, grad_clip=1.0):
+def train_epoch(model, dataloader, optimizer, device, grad_clip=1.0, pos_readout="full_text"):
     model.train()
     total_loss = 0.0
     act_loss = 0.0
@@ -154,17 +171,23 @@ def train_epoch(model, dataloader, optimizer, device, grad_clip=1.0):
 
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
         visual_maps = batch["visual_maps"].to(device)
         event_positions = batch["event_positions"].to(device)
         event_counts = batch["event_counts"].to(device)
         act_mask = batch["act_mask"].to(device)
         pos_mask = batch["pos_mask"].to(device)
-
-        logits = model(input_ids, visual_maps=visual_maps, event_positions=event_positions, event_counts=event_counts)
+        
+        # Different logic based on pos_readout mode
+        if pos_readout == "full_text":
+            logits = model(input_ids, visual_maps=visual_maps, event_positions=event_positions, event_counts=event_counts)
+            labels = batch["labels"].to(device)
+        else:  # visual_only
+            target_input_ids = batch["target_input_ids"].to(device)
+            logits = model(input_ids, visual_maps=visual_maps, event_positions=event_positions, event_counts=event_counts, target_input_ids=target_input_ids)
+            labels = batch["target_labels"].to(device)
         
         # Compute losses with breakdown
-        losses = compute_losses_by_type(logits, labels, act_mask, pos_mask)
+        losses = compute_losses_by_type(logits, labels, act_mask, pos_mask, pos_readout=pos_readout)
         loss = losses["total_loss"]
 
         optimizer.zero_grad()
@@ -187,7 +210,7 @@ def train_epoch(model, dataloader, optimizer, device, grad_clip=1.0):
     }
 
 
-def evaluate_model(model, dataloader, device):
+def evaluate_model(model, dataloader, device, pos_readout="full_text"):
     model.eval()
     total_loss = 0.0
     act_loss = 0.0
@@ -199,17 +222,23 @@ def evaluate_model(model, dataloader, device):
     with torch.no_grad():
         for batch in dataloader:
             input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
             visual_maps = batch["visual_maps"].to(device)
             event_positions = batch["event_positions"].to(device)
             event_counts = batch["event_counts"].to(device)
             act_mask = batch["act_mask"].to(device)
             pos_mask = batch["pos_mask"].to(device)
-
-            logits = model(input_ids, visual_maps=visual_maps, event_positions=event_positions, event_counts=event_counts)
+            
+            # Different logic based on pos_readout mode
+            if pos_readout == "full_text":
+                logits = model(input_ids, visual_maps=visual_maps, event_positions=event_positions, event_counts=event_counts)
+                labels = batch["labels"].to(device)
+            else:  # visual_only
+                target_input_ids = batch["target_input_ids"].to(device)
+                logits = model(input_ids, visual_maps=visual_maps, event_positions=event_positions, event_counts=event_counts, target_input_ids=target_input_ids)
+                labels = batch["target_labels"].to(device)
             
             # Compute losses with breakdown
-            losses = compute_losses_by_type(logits, labels, act_mask, pos_mask)
+            losses = compute_losses_by_type(logits, labels, act_mask, pos_mask, pos_readout=pos_readout)
 
             # Accumulate weighted losses
             total_loss += float(losses["total_loss"].item()) * losses["total_bytes"]
@@ -351,12 +380,12 @@ def train(args: argparse.Namespace, logger: Logger) -> dict[str, object]:
     
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
-        train_losses = train_epoch(model, train_loader, optimizer, device, grad_clip=args.grad_clip)
+        train_losses = train_epoch(model, train_loader, optimizer, device, grad_clip=args.grad_clip, pos_readout=args.pos_readout)
         epoch_time = time.time() - epoch_start
 
         # Evaluate every N epochs
         if epoch % args.evaluate_every == 0 or epoch == args.epochs:
-            val_losses = evaluate_model(model, val_loader, device)
+            val_losses = evaluate_model(model, val_loader, device, pos_readout=args.pos_readout)
             
             msg = (f"Epoch {epoch:3d}/{args.epochs} | "
                    f"Train: {train_losses['total']:.4f} / {train_losses['act']:.4f} / {train_losses['pos']:.4f} | "

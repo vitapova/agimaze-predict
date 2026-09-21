@@ -97,6 +97,11 @@ def collate_visual_examples_with_actions(
     labels: list[list[int]] = []
     act_masks: list[list[int]] = []
     pos_masks: list[list[int]] = []
+    target_input_ids: list[list[int]] = []
+    target_labels: list[list[int]] = []
+    
+    # For visual_only mode: find max target length
+    max_target = max(len(item.target_suffix) for item in serialized)
 
     for item in serialized:
         ids = item.token_ids
@@ -130,6 +135,11 @@ def collate_visual_examples_with_actions(
         labels.append(row_labels)
         act_masks.append(row_act_mask)
         pos_masks.append(row_pos_mask)
+        
+        # For visual_only mode: teacher-forced target sequence
+        target_input = [ids[item.target_start - 1], *item.target_suffix[:-1]]
+        target_input_ids.append(target_input + [PAD_TOKEN_ID] * (max_target - len(target_input)))
+        target_labels.append([*item.target_suffix, *([IGNORE_INDEX] * (max_target - len(item.target_suffix)))])
 
     # Build visual canvases using original _canvas function
     visual_maps: list[list[list[int]]] = []
@@ -158,6 +168,8 @@ def collate_visual_examples_with_actions(
         "visual_maps": visual_maps,
         "event_positions": event_positions,
         "event_counts": event_counts,
+        "target_input_ids": target_input_ids,
+        "target_labels": target_labels,
         "act_mask": act_masks,
         "pos_mask": pos_masks,
     }
