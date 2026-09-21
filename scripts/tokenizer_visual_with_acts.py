@@ -110,28 +110,23 @@ def collate_visual_examples_with_actions(
         row_act_mask = [0] * width
         row_pos_mask = [0] * width
         
-        # POS target (original behavior)
+        # ACT content (NEW) - process FIRST
+        # In visual transformer: token_ids = actions + \n<POS> + target_suffix
+        # target_start points to the '<' of <POS> tag
+        # Everything before <POS> is action content (including newline)
+        if item.target_start > 0:
+            # Mark all ACT bytes (everything before target_start)
+            for index in range(0, min(item.target_start - 1, len(ids) - 1)):
+                row_labels[index] = ids[index + 1]
+                row_act_mask[index] = 1
+        
+        # POS target (original behavior) - process SECOND
+        # This will override act_mask for any overlap (shouldn't happen)
         for index in range(item.target_start - 1, len(ids) - 1):
             row_labels[index] = ids[index + 1]
             row_pos_mask[index] = 1
-        
-        # ACT content (NEW)
-        # Visual transformer stores event_positions (end of each </ACT>)
-        # We need to mark all bytes before target_start as ACT
-        # (since token_ids = actions + \n<POS> + target)
-        if item.target_start > 0:
-            # Everything before target_start is ACT content (actions + \n<POS>)
-            # Actually, we only want ACT content, not the <POS> tag
-            # target_start-1 points to the '>' of <POS>, so ACT ends at target_start - 5 (len('<POS>'))
-            pos_tag_len = 5  # len('<POS>')
-            act_end = item.target_start - pos_tag_len - 1  # -1 for the newline
-            
-            # Mark all bytes in ACT region
-            for index in range(0, min(act_end, len(ids) - 1)):
-                if row_labels[index] == IGNORE_INDEX:
-                    # Not yet included (not in target), so it's action
-                    row_labels[index] = ids[index + 1]
-                    row_act_mask[index] = 1
+            # Clear act_mask if there was overlap
+            row_act_mask[index] = 0
         
         input_ids.append(row_input)
         labels.append(row_labels)
