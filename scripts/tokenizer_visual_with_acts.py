@@ -116,20 +116,22 @@ def collate_visual_examples_with_actions(
             row_pos_mask[index] = 1
         
         # ACT content (NEW)
-        # Include closing </ACT> tag in loss so model learns to stop properly
-        act_ranges = find_act_content_ranges(ids)
-        for content_start, content_end in act_ranges:
-            # content_end points to first byte of </ACT>
-            # We want to include the entire </ACT> tag (6 bytes)
-            act_close_len = 6  # len("</ACT>")
-            full_end = min(content_end + act_close_len, len(ids))
+        # Visual transformer stores event_positions (end of each </ACT>)
+        # We need to mark all bytes before target_start as ACT
+        # (since token_ids = actions + \n<POS> + target)
+        if item.target_start > 0:
+            # Everything before target_start is ACT content (actions + \n<POS>)
+            # Actually, we only want ACT content, not the <POS> tag
+            # target_start-1 points to the '>' of <POS>, so ACT ends at target_start - 5 (len('<POS>'))
+            pos_tag_len = 5  # len('<POS>')
+            act_end = item.target_start - pos_tag_len - 1  # -1 for the newline
             
-            # Predict content bytes + closing tag (causal: predict token i+1 from i)
-            for index in range(content_start - 1, min(full_end - 1, len(ids) - 1)):
-                row_labels[index] = ids[index + 1]
-                row_act_mask[index] = 1
-                # Remove from POS mask if accidentally overlapping
-                row_pos_mask[index] = 0
+            # Mark all bytes in ACT region
+            for index in range(0, min(act_end, len(ids) - 1)):
+                if row_labels[index] == IGNORE_INDEX:
+                    # Not yet included (not in target), so it's action
+                    row_labels[index] = ids[index + 1]
+                    row_act_mask[index] = 1
         
         input_ids.append(row_input)
         labels.append(row_labels)

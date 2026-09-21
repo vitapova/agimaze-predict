@@ -203,6 +203,10 @@ def train_epoch(model, dataloader, optimizer, device, grad_clip=1.0, pos_readout
         act_bytes += losses["act_bytes"]
         pos_bytes += losses["pos_bytes"]
 
+    # Debug: log if act_bytes is zero
+    if act_bytes == 0:
+        print(f"WARNING: act_bytes = 0 in training! total_bytes={total_bytes}, pos_bytes={pos_bytes}")
+    
     return {
         "total": total_loss / total_bytes if total_bytes > 0 else 0.0,
         "act": act_loss / act_bytes if act_bytes > 0 else 0.0,
