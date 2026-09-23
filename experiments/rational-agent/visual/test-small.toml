@@ -1,0 +1,33 @@
+# Quick test config with small dataset
+
+[data]
+train_files = ["../../../datasets/seq/3x3-keys-rational-train1-1step.jsonl"]
+validation_files = ["../../../datasets/seq/3x3-keys-rational-valid-4step.jsonl"]
+
+[model]
+context_length = 768
+d_model = 128
+n_heads = 4
+n_layers = 2
+mlp_multiplier = 4
+dropout = 0.0
+canvas_height = 9
+canvas_width = 17
+visual_d_model = 128
+visual_spatial_layers = 2
+visual_temporal_layers = 2
+temporal_history = 8
+pos_readout = "full_text"
+
+[training]
+seed = 42
+epochs = 2
+evaluate_every = 1
+batch_size = 8
+learning_rate = 0.0002
+weight_decay = 0.01
+grad_clip = 1.0
+
+[run]
+output = "../../../runs/test-visual-small.pt"
+overwrite = true
