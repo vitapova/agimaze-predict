@@ -62,12 +62,30 @@ class VisualTokenizerTest(unittest.TestCase):
 
 @unittest.skipUnless(TORCH_AVAILABLE, "optional dependency 'torch' is not installed")
 class VisualTransformerTest(unittest.TestCase):
-    def test_visual_only_action_training_is_rejected(self) -> None:
-        from argparse import Namespace
-        from agimaze_predict.baselines.visual_transformer.train import train
+    def test_visual_only_actions_use_text_readout_and_position_uses_target_decoder(self) -> None:
+        example = PerStepExample(input="<MAP>ab\ncd</MAP>\n<ACT>left</ACT>", target="<POS>(0, 1)</POS>")
+        batch = collate_visual_examples([example], context_length=64, canvas_height=3, canvas_width=4, predict_actions=True)
+        model = VisualTransformer(VisualTransformerConfig(context_length=64, d_model=32, visual_d_model=32, n_heads=4, n_layers=1, visual_spatial_layers=1, visual_temporal_layers=1, canvas_height=3, canvas_width=4, pos_readout="visual_only"))
+        pos, act = model(torch.tensor(batch["input_ids"]), visual_maps=torch.tensor(batch["visual_maps"]), event_positions=torch.tensor(batch["event_positions"]), event_counts=torch.tensor(batch["event_counts"]), target_input_ids=torch.tensor(batch["target_input_ids"]), return_action_logits=True)
+        act_labels = torch.tensor(batch["labels"]).masked_fill(~torch.tensor(batch["act_mask"]).bool(), -100)
+        loss = target_cross_entropy(act, act_labels) + target_cross_entropy(pos, torch.tensor(batch["target_labels"]))
+        loss.backward()
+        self.assertEqual(pos.shape[:2], torch.tensor(batch["target_labels"]).shape)
+        self.assertIsNotNone(model.output.weight.grad)
+        self.assertIsNotNone(model.target_blocks[0].cross_attention.query.weight.grad)
 
-        with self.assertRaisesRegex(ValueError, "requires pos_readout='full_text'"):
-            train(Namespace(seed=0, predict_actions=True, pos_readout="visual_only"))
+    def test_action_logits_do_not_depend_on_future_action_bytes(self) -> None:
+        from agimaze_predict.data.prepared import PreparedExample
+
+        first = PerStepExample(input="<MAP>ab\ncd</MAP>\n<ACT>left</ACT>\n<ACT>up</ACT>", target="<POS>(0, 1)</POS>")
+        second = PreparedExample(input=first.input.replace("<ACT>up</ACT>", "<ACT>dn</ACT>"), target=first.target)
+        batch = collate_visual_examples([first, second], context_length=80, canvas_height=3, canvas_width=4, predict_actions=True)
+        model = VisualTransformer(VisualTransformerConfig(context_length=80, d_model=32, visual_d_model=32, n_heads=4, n_layers=1, visual_spatial_layers=1, visual_temporal_layers=1, canvas_height=3, canvas_width=4, pos_readout="visual_only"))
+        model.eval()
+        with torch.no_grad():
+            _, acts = model(torch.tensor(batch["input_ids"]), visual_maps=torch.tensor(batch["visual_maps"]), event_positions=torch.tensor(batch["event_positions"]), event_counts=torch.tensor(batch["event_counts"]), target_input_ids=torch.tensor(batch["target_input_ids"]), return_action_logits=True)
+        prompt_end = batch["input_ids"][0].index(ord("u"))
+        self.assertTrue(torch.allclose(acts[0, :prompt_end], acts[1, :prompt_end], atol=1e-6))
 
     def test_action_loss_backpropagates_through_visual_path(self) -> None:
         example = PerStepExample(input="<MAP>ab\ncd</MAP>\n<ACT>left</ACT>", target="<POS>(0, 1)</POS>")

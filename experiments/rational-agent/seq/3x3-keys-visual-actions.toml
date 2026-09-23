@@ -31,7 +31,7 @@ visual_d_model = 128
 visual_spatial_layers = 2
 visual_temporal_layers = 2
 temporal_history = 8
-pos_readout = "full_text"
+pos_readout = "visual_only" # original paper's stronger POS readout; ACT uses causal text output
 visual_gate_init = 0.05
 map_supervision = "none"
 

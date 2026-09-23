@@ -69,13 +69,23 @@ def evaluate_action_losses(model: VisualTransformer, examples: Sequence[Prepared
     collate = _collator(model.config.context_length, model.config.canvas_height, model.config.canvas_width, True)
     for start in range(0, len(examples), batch_size):
         batch = {key: value.to(device) for key, value in collate(examples[start:start + batch_size]).items()}
-        logits = model(batch["input_ids"], visual_maps=batch["visual_maps"], event_positions=batch["event_positions"], event_counts=batch["event_counts"])
-        for name, mask in (("total", batch["labels"].ne(-100)), ("act", batch["act_mask"].bool()), ("pos", batch["pos_mask"].bool())):
-            active = int(mask.sum().item())
+        kwargs = {key: batch[key] for key in ("visual_maps", "event_positions", "event_counts")}
+        if model.config.pos_readout == "visual_only":
+            pos_logits, act_logits = model(batch["input_ids"], **kwargs,
+                                           target_input_ids=batch["target_input_ids"], return_action_logits=True)
+            losses = (("act", act_logits, batch["labels"].masked_fill(~batch["act_mask"].bool(), -100)),
+                      ("pos", pos_logits, batch["target_labels"]))
+        else:
+            logits = model(batch["input_ids"], **kwargs)
+            losses = (("act", logits, batch["labels"].masked_fill(~batch["act_mask"].bool(), -100)),
+                      ("pos", logits, batch["labels"].masked_fill(~batch["pos_mask"].bool(), -100)))
+        for name, logits, labels in losses:
+            active = int(labels.ne(-100).sum().item())
             if active:
-                labels = batch["labels"].masked_fill(~mask, -100)
                 sums[name] += float(target_cross_entropy(logits, labels).item()) * active
                 counts[name] += active
+    sums["total"] = sums["act"] + sums["pos"]
+    counts["total"] = counts["act"] + counts["pos"]
     return {f"{name}_byte_nll": sums[name] / counts[name] if counts[name] else 0.0 for name in sums} | {
         f"{name}_bytes": counts[name] for name in sums
     }
@@ -84,8 +94,6 @@ def evaluate_action_losses(model: VisualTransformer, examples: Sequence[Prepared
 def train(args: argparse.Namespace, logger: Logger | None = None) -> dict[str, object]:
     seed_everything(args.seed)
     predict_actions = getattr(args, "predict_actions", False)
-    if predict_actions and args.pos_readout != "full_text":
-        raise ValueError("action loss requires pos_readout='full_text': visual_only decodes POS from a separate head")
     # Also support callers that invoke train() directly rather than main().
     if logger is None:
         logger = make_logger(Path(args.output))
@@ -120,7 +128,8 @@ def train(args: argparse.Namespace, logger: Logger | None = None) -> dict[str, o
     logger.log(f"Learning rate: {args.learning_rate}; weight decay: {args.weight_decay}; grad clip: {args.grad_clip}")
     logger.log(f"Evaluate every: {args.evaluate_every} epochs")
     if predict_actions:
-        logger.log("Supervision: ACT content + </ACT> and POS answer; opening <ACT> remains masked")
+        logger.log("Supervision: ACT content + </ACT> and POS answer; opening <ACT> remains masked; "
+                   f"POS readout: {config.pos_readout}")
     logger.log("\n" + "=" * 80 + "\nTRAINING\n" + "=" * 80)
     best_val_loss = float("inf")
     best_checkpoint: dict[str, object] | None = None
@@ -137,28 +146,47 @@ def train(args: argparse.Namespace, logger: Logger | None = None) -> dict[str, o
                 logits = model(batch["input_ids"], visual_maps=batch["visual_maps"], event_positions=batch["event_positions"], event_counts=batch["event_counts"])
                 labels = batch["labels"]
             else:
-                logits = model(batch["input_ids"], visual_maps=batch["visual_maps"], event_positions=batch["event_positions"], event_counts=batch["event_counts"], target_input_ids=batch["target_input_ids"])
+                result = model(batch["input_ids"], visual_maps=batch["visual_maps"], event_positions=batch["event_positions"], event_counts=batch["event_counts"], target_input_ids=batch["target_input_ids"], return_action_logits=predict_actions)
+                if predict_actions:
+                    pos_logits, act_logits = result
+                else:
+                    logits = result
                 labels = batch["target_labels"]
-            loss = target_cross_entropy(logits, labels)
+            if predict_actions and config.pos_readout == "visual_only":
+                act_labels = batch["labels"].masked_fill(~batch["act_mask"].bool(), -100)
+                act_count = int(act_labels.ne(-100).sum().item())
+                pos_count = int(labels.ne(-100).sum().item())
+                act_nll = target_cross_entropy(act_logits, act_labels)
+                pos_nll = target_cross_entropy(pos_logits, labels)
+                loss = (act_nll * act_count + pos_nll * pos_count) / (act_count + pos_count)
+            else:
+                loss = target_cross_entropy(logits, labels)
             loss.backward()
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
-            active = int(labels.ne(-100).sum().item())
+            active = (act_count + pos_count if predict_actions and config.pos_readout == "visual_only"
+                      else int(labels.ne(-100).sum().item()))
             loss_total += float(loss.item()) * active
             bytes_total += active
             if predict_actions:
                 with torch.no_grad():
-                    per_byte = F.cross_entropy(
-                        logits.detach().reshape(-1, logits.size(-1)),
-                        labels.reshape(-1), ignore_index=-100, reduction="none",
-                    ).reshape_as(labels)
-                    act_mask = batch["act_mask"].bool()
-                    pos_mask = batch["pos_mask"].bool()
-                    train_act_sum += float(per_byte[act_mask].sum().item())
-                    train_pos_sum += float(per_byte[pos_mask].sum().item())
-                    train_act_bytes += int(act_mask.sum().item())
-                    train_pos_bytes += int(pos_mask.sum().item())
+                    if config.pos_readout == "visual_only":
+                        train_act_sum += float(act_nll.item()) * act_count
+                        train_pos_sum += float(pos_nll.item()) * pos_count
+                        train_act_bytes += act_count
+                        train_pos_bytes += pos_count
+                    else:
+                        per_byte = F.cross_entropy(
+                            logits.detach().reshape(-1, logits.size(-1)),
+                            labels.reshape(-1), ignore_index=-100, reduction="none",
+                        ).reshape_as(labels)
+                        act_mask = batch["act_mask"].bool()
+                        pos_mask = batch["pos_mask"].bool()
+                        train_act_sum += float(per_byte[act_mask].sum().item())
+                        train_pos_sum += float(per_byte[pos_mask].sum().item())
+                        train_act_bytes += int(act_mask.sum().item())
+                        train_pos_bytes += int(pos_mask.sum().item())
         train_nll = loss_total / bytes_total
         train_breakdown = (
             f" train_act_byte_nll={train_act_sum / train_act_bytes:.6f} "
@@ -230,7 +258,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float); parser.add_argument("--weight-decay", type=float); parser.add_argument("--grad-clip", type=float)
     parser.add_argument("--context-length", type=int); parser.add_argument("--d-model", type=int); parser.add_argument("--n-heads", type=int); parser.add_argument("--n-layers", type=int); parser.add_argument("--mlp-multiplier", type=int); parser.add_argument("--dropout", type=float)
     parser.add_argument("--canvas-height", type=int); parser.add_argument("--canvas-width", type=int); parser.add_argument("--visual-d-model", type=int); parser.add_argument("--visual-spatial-layers", type=int); parser.add_argument("--visual-temporal-layers", type=int); parser.add_argument("--temporal-history", type=int); parser.add_argument("--pos-readout", choices=("full_text", "visual_only")); parser.add_argument("--visual-gate-init", type=float)
-    parser.add_argument("--predict-actions", action="store_true", help="supervise ACT contents and closing tags in full_text mode")
+    parser.add_argument("--predict-actions", action="store_true", help="supervise ACT answers with full_text or visual_only POS readout")
     return parser
 
 

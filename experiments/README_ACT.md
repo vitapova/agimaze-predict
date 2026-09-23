@@ -58,12 +58,15 @@ This experiment extends the byte-transformer to predict **both**:
 ## Visual Transformer: same supervision protocol
 
 The visual Transformer reads the initial `<MAP>` through its visual canvas; the
-text stream starts with the first `<ACT>`. In `full_text` mode, pass
-`--predict-actions` (or set `[training] predict_actions = true` in TOML) to
-supervise each action's content and `</ACT>`, plus the position answer after
-the known `<POS>` query. The opening `<ACT>` and its start time stay masked.
-The architecture is unchanged. `visual_only` has a separate POS decoder and
-cannot train ACT outputs with this protocol.
+text stream starts with the first `<ACT>`. Pass `--predict-actions` (or set
+`[training] predict_actions = true` in TOML) to supervise each action's content
+and `</ACT>`, plus the position answer after the known `<POS>` query. The opening
+`<ACT>` and its start time stay masked. In `full_text`, the causal text output
+predicts both ACT and POS. In `visual_only`, the **unchanged visual-only POS
+decoder** still predicts POS from the final visual frame, while the already
+existing causal text output predicts ACT from the map and preceding actions;
+the forward interface can return both outputs during joint training. This
+adds no parameters and leaves position-only inference/checkpoints compatible.
 
 ```bash
 python3 scripts/train_visual_transformer_with_actions.py \

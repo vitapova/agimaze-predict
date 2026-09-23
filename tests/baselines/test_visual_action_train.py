@@ -15,6 +15,29 @@ from agimaze_predict.baselines.visual_transformer.train import make_logger, trai
 
 
 class VisualActionTrainTest(unittest.TestCase):
+    def test_visual_only_combined_loss_saves_checkpoint(self) -> None:
+        from agimaze_predict.baselines.visual_transformer.model import VisualTransformer, VisualTransformerConfig
+
+        fixture = Path(__file__).resolve().parents[1] / "fixtures" / "tiny_per_step.jsonl"
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "visual_only.pt"
+            args = Namespace(**(DEFAULT_TRAINING_ARGUMENTS | {
+                "train_datasets": [fixture], "validation_datasets": [fixture],
+                "output": output, "predict_actions": True, "pos_readout": "visual_only",
+                "epochs": 1, "evaluate_every": 1, "batch_size": 2,
+                "context_length": 64, "d_model": 16, "visual_d_model": 16,
+                "n_layers": 1, "n_heads": 4, "visual_spatial_layers": 1,
+                "visual_temporal_layers": 1, "canvas_height": 3, "canvas_width": 9,
+            }))
+            result = train(args, make_logger(output))
+            self.assertEqual(result["epoch"], 1)
+            self.assertEqual(result["metrics"]["total_bytes"],
+                             result["metrics"]["act_bytes"] + result["metrics"]["pos_bytes"])
+            self.assertGreater(result["metrics"]["act_bytes"], 0)
+            checkpoint = torch.load(output, map_location="cpu", weights_only=False)
+            model = VisualTransformer(VisualTransformerConfig(**checkpoint["model_config"]))
+            model.load_state_dict(checkpoint["model_state_dict"])
+
     def test_saves_only_improved_validation_and_logs_each_epoch(self) -> None:
         fixture = Path(__file__).resolve().parents[1] / "fixtures" / "tiny_per_step.jsonl"
         with tempfile.TemporaryDirectory() as directory:
