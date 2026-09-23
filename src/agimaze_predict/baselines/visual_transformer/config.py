@@ -86,6 +86,7 @@ def resolve_training_arguments(parser: argparse.ArgumentParser, argv: Sequence[s
     values = dict(DEFAULT_TRAINING_ARGUMENTS)
     if config_path is not None:
         values.update(load_training_config(config_path))
+        values["config_path"] = config_path
     values.update(explicit)
     missing = [key for key in ("train_datasets", "validation_datasets", "output") if key not in values]
     if missing:

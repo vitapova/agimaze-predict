@@ -70,6 +70,14 @@ python3 scripts/train_visual_transformer_with_actions.py \
   --config experiments/rational-agent/seq/3x3-keys-visual-actions.toml
 ```
 
+The visual trainer writes a timestamped `.log` next to the configured `.pt`,
+mirroring the byte-action trainer's console output, configuration, arguments,
+model summary, per-epoch train/validation ACT+POS losses, and run summary.
+At each validation interval it replaces the configured checkpoint **only if**
+the combined validation ACT+POS byte NLL strictly improves. The checkpoint's
+`epoch` and `metrics` describe that best epoch, not necessarily the last one.
+Existing checkpoints require `--overwrite` or `[run] overwrite = true`.
+
 Validation reports teacher-forced total/ACT/POS byte NLL, **not** autonomous
 action selection or goal-directed success. Validation demonstrations include
 the correct earlier actions, so evaluate rollouts separately before claiming
