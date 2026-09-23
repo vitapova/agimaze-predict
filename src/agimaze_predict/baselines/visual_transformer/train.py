@@ -36,15 +36,39 @@ def load_examples(paths: Sequence[Path]) -> list[PreparedExample]:
     return examples
 
 
-def _collator(context_length: int, canvas_height: int, canvas_width: int):
+def _collator(context_length: int, canvas_height: int, canvas_width: int, predict_actions: bool = False):
     def collate(examples: Sequence[PreparedExample]) -> dict[str, Tensor]:
-        batch = collate_visual_examples(examples, context_length=context_length, canvas_height=canvas_height, canvas_width=canvas_width)
+        batch = collate_visual_examples(examples, context_length=context_length, canvas_height=canvas_height, canvas_width=canvas_width, predict_actions=predict_actions)
         return {key: torch.tensor(value, dtype=torch.long) for key, value in batch.items()}
     return collate
 
 
+@torch.no_grad()
+def evaluate_action_losses(model: VisualTransformer, examples: Sequence[PreparedExample], *, device: torch.device, batch_size: int = 32) -> dict[str, float]:
+    """Teacher-forced byte NLL; do not confuse this with rollout/action accuracy."""
+    model.eval()
+    sums = {"total": 0.0, "act": 0.0, "pos": 0.0}
+    counts = {key: 0 for key in sums}
+    collate = _collator(model.config.context_length, model.config.canvas_height, model.config.canvas_width, True)
+    for start in range(0, len(examples), batch_size):
+        batch = {key: value.to(device) for key, value in collate(examples[start:start + batch_size]).items()}
+        logits = model(batch["input_ids"], visual_maps=batch["visual_maps"], event_positions=batch["event_positions"], event_counts=batch["event_counts"])
+        for name, mask in (("total", batch["labels"].ne(-100)), ("act", batch["act_mask"].bool()), ("pos", batch["pos_mask"].bool())):
+            active = int(mask.sum().item())
+            if active:
+                labels = batch["labels"].masked_fill(~mask, -100)
+                sums[name] += float(target_cross_entropy(logits, labels).item()) * active
+                counts[name] += active
+    return {f"{name}_byte_nll": sums[name] / counts[name] if counts[name] else 0.0 for name in sums} | {
+        f"{name}_bytes": counts[name] for name in sums
+    }
+
+
 def train(args: argparse.Namespace) -> dict[str, object]:
     seed_everything(args.seed)
+    predict_actions = getattr(args, "predict_actions", False)
+    if predict_actions and args.pos_readout != "full_text":
+        raise ValueError("action loss requires pos_readout='full_text': visual_only decodes POS from a separate head")
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     config = VisualTransformerConfig(
         context_length=args.context_length, d_model=args.d_model, n_heads=args.n_heads,
@@ -54,10 +78,12 @@ def train(args: argparse.Namespace) -> dict[str, object]:
         temporal_history=args.temporal_history, pos_readout=args.pos_readout, visual_gate_init=args.visual_gate_init,
     )
     train_examples, validation_examples = load_examples(args.train_datasets), load_examples(args.validation_datasets)
-    loader = DataLoader(train_examples, batch_size=args.batch_size, shuffle=True, collate_fn=_collator(config.context_length, config.canvas_height, config.canvas_width))
+    loader = DataLoader(train_examples, batch_size=args.batch_size, shuffle=True, collate_fn=_collator(config.context_length, config.canvas_height, config.canvas_width, predict_actions))
     model = VisualTransformer(config).to(device)
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     print("Training set size:", len(train_examples))
+    if predict_actions:
+        print("Supervision: ACT content + </ACT> and POS answer; opening <ACT> remains masked")
     for epoch in range(1, args.epochs + 1):
         model.train()
         loss_total, bytes_total = 0.0, 0
@@ -79,12 +105,21 @@ def train(args: argparse.Namespace) -> dict[str, object]:
             loss_total += float(loss.item()) * active
             bytes_total += active
         if epoch == 1 or epoch % args.evaluate_every == 0 or epoch == args.epochs:
-            metrics = evaluate_examples(model, validation_examples, device=device)
-            print(f"epoch={epoch} train_target_byte_nll={loss_total / bytes_total:.6f} val_target_byte_nll={metrics['target_byte_nll']:.6f} val_greedy_exact_target_accuracy={metrics['greedy_exact_target_accuracy']:.4f}", flush=True)
-    metrics = evaluate_examples(model, validation_examples, device=device)
+            metrics = (evaluate_action_losses(model, validation_examples, device=device, batch_size=args.batch_size)
+                       if predict_actions else evaluate_examples(model, validation_examples, device=device))
+            if predict_actions:
+                print(f"epoch={epoch} train_supervised_byte_nll={loss_total / bytes_total:.6f} "
+                      f"val_total_byte_nll={metrics['total_byte_nll']:.6f} "
+                      f"val_act_byte_nll={metrics['act_byte_nll']:.6f} "
+                      f"val_pos_byte_nll={metrics['pos_byte_nll']:.6f}", flush=True)
+            else:
+                print(f"epoch={epoch} train_target_byte_nll={loss_total / bytes_total:.6f} val_target_byte_nll={metrics['target_byte_nll']:.6f} val_greedy_exact_target_accuracy={metrics['greedy_exact_target_accuracy']:.4f}", flush=True)
+    metrics = (evaluate_action_losses(model, validation_examples, device=device, batch_size=args.batch_size)
+               if predict_actions else evaluate_examples(model, validation_examples, device=device))
     checkpoint = {
         "format": "agimaze_predict.visual_transformer.v0",
         "model_config": asdict(config), "model_state_dict": model.state_dict(), "metrics": metrics,
+        "predict_actions": predict_actions,
         "datasets": {"train_paths": [str(path.resolve()) for path in args.train_datasets], "validation_paths": [str(path.resolve()) for path in args.validation_datasets]},
     }
     output = Path(args.output)
@@ -108,6 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float); parser.add_argument("--weight-decay", type=float); parser.add_argument("--grad-clip", type=float)
     parser.add_argument("--context-length", type=int); parser.add_argument("--d-model", type=int); parser.add_argument("--n-heads", type=int); parser.add_argument("--n-layers", type=int); parser.add_argument("--mlp-multiplier", type=int); parser.add_argument("--dropout", type=float)
     parser.add_argument("--canvas-height", type=int); parser.add_argument("--canvas-width", type=int); parser.add_argument("--visual-d-model", type=int); parser.add_argument("--visual-spatial-layers", type=int); parser.add_argument("--visual-temporal-layers", type=int); parser.add_argument("--temporal-history", type=int); parser.add_argument("--pos-readout", choices=("full_text", "visual_only")); parser.add_argument("--visual-gate-init", type=float)
+    parser.add_argument("--predict-actions", action="store_true", help="supervise ACT contents and closing tags in full_text mode")
     return parser
 
 

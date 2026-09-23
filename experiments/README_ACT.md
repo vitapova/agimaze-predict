@@ -4,7 +4,7 @@
 
 This experiment extends the byte-transformer to predict **both**:
 1. **Target position** (`<POS>...</POS>`) — original behavior
-2. **Action content** (`<ACT>content</ACT>`) — NEW: enables learning from rational demonstrations
+2. **Action answer** (`<ACT>content</ACT>`) — content and closing tag, not opening tag
 
 ## Motivation
 
@@ -44,7 +44,7 @@ This experiment extends the byte-transformer to predict **both**:
 - `src/agimaze_predict/baselines/byte_transformer/tokenizer_with_acts.py`
   - New function: `collate_byte_examples_with_actions()`
   - Finds all `<ACT>content</ACT>` ranges in input
-  - Includes content bytes (not tags) in loss mask
+  - Includes content bytes and the closing `</ACT>` tag, but not `<ACT>`
 
 - `scripts/train_byte_transformer_with_actions.py`
   - Training script that uses modified collator
@@ -54,6 +54,34 @@ This experiment extends the byte-transformer to predict **both**:
 - Model architecture (vanilla byte-transformer)
 - Dataset format (`seq` and `txt` JSONL)
 - No code changes needed in data loading
+
+## Visual Transformer: same supervision protocol
+
+The visual Transformer reads the initial `<MAP>` through its visual canvas; the
+text stream starts with the first `<ACT>`. In `full_text` mode, pass
+`--predict-actions` (or set `[training] predict_actions = true` in TOML) to
+supervise each action's content and `</ACT>`, plus the position answer after
+the known `<POS>` query. The opening `<ACT>` and its start time stay masked.
+The architecture is unchanged. `visual_only` has a separate POS decoder and
+cannot train ACT outputs with this protocol.
+
+```bash
+python3 scripts/train_visual_transformer_with_actions.py \
+  --config experiments/rational-agent/seq/3x3-keys-visual-actions.toml
+```
+
+Validation reports teacher-forced total/ACT/POS byte NLL, **not** autonomous
+action selection or goal-directed success. Validation demonstrations include
+the correct earlier actions, so evaluate rollouts separately before claiming
+policy competence. Use a Python 3.11+ environment with PyTorch installed.
+
+**Split caveat:** the rational `3x3-keys` shards currently selected above are
+not disjoint as serialized examples: 618 distinct validation `(input, target)`
+pairs also occur in training (across the 4- and 8-step validation files).
+Treat validation loss as a pipeline diagnostic, not a generalization estimate;
+regenerate maze-disjoint rational train/validation splits before comparing
+held-out policy behavior. Identical rendered maps alone need not imply the
+same source maze, but identical complete examples are definite overlap.
 
 ## Usage
 

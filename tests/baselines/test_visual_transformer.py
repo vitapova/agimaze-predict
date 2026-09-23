@@ -14,6 +14,31 @@ if TORCH_AVAILABLE:
 
 
 class VisualTokenizerTest(unittest.TestCase):
+    def test_action_supervision_preserves_known_openings_and_event_causality(self) -> None:
+        example = PerStepExample(
+            input="<MAP>ab\ncd</MAP>\n<ACT>left</ACT>\n<ACT>up</ACT>",
+            target="<POS>(0, 1)</POS>",
+        )
+        item = serialize_visual_example(example)
+        batch = collate_visual_examples([example], context_length=80, canvas_height=3, canvas_width=4, predict_actions=True)
+        ids = item.token_ids
+        supervised = {i + 1 for i, label in enumerate(batch["labels"][0]) if label != -100}
+        expected_act = set()
+        for text in (b"left", b"up"):
+            opening = bytes(ids).find(b"<ACT>" + text)
+            begin = opening + len(b"<ACT>")
+            end = begin + len(text) + len(b"</ACT>")
+            expected_act.update(range(begin, end))
+            self.assertNotIn(opening, supervised)
+            self.assertEqual(batch["event_counts"][0][begin - 1], sum(event <= begin - 1 for event in item.event_positions))
+        expected_pos = set(range(item.target_start, len(ids)))
+        self.assertEqual(supervised, expected_act | expected_pos)
+        self.assertEqual(sum(batch["act_mask"][0]), len(expected_act))
+        self.assertEqual(sum(batch["pos_mask"][0]), len(expected_pos))
+        self.assertEqual(batch["labels"][0][item.target_start - 1], ord("("))
+        original = collate_visual_examples([example], context_length=80, canvas_height=3, canvas_width=4)
+        self.assertEqual(original["labels"][0][len(b"<ACT>") - 1], -100)
+
     def test_removes_map_from_text_and_uses_pos_as_query(self) -> None:
         example = PerStepExample(input="<MAP>ab\ncd</MAP>\n<ACT>left</ACT>", target="<POS>(0, 1)</POS>")
         item = serialize_visual_example(example)
@@ -37,6 +62,23 @@ class VisualTokenizerTest(unittest.TestCase):
 
 @unittest.skipUnless(TORCH_AVAILABLE, "optional dependency 'torch' is not installed")
 class VisualTransformerTest(unittest.TestCase):
+    def test_visual_only_action_training_is_rejected(self) -> None:
+        from argparse import Namespace
+        from agimaze_predict.baselines.visual_transformer.train import train
+
+        with self.assertRaisesRegex(ValueError, "requires pos_readout='full_text'"):
+            train(Namespace(seed=0, predict_actions=True, pos_readout="visual_only"))
+
+    def test_action_loss_backpropagates_through_visual_path(self) -> None:
+        example = PerStepExample(input="<MAP>ab\ncd</MAP>\n<ACT>left</ACT>", target="<POS>(0, 1)</POS>")
+        batch = collate_visual_examples([example], context_length=64, canvas_height=3, canvas_width=4, predict_actions=True)
+        model = VisualTransformer(VisualTransformerConfig(context_length=64, d_model=32, visual_d_model=32, n_heads=4, n_layers=1, visual_spatial_layers=1, visual_temporal_layers=1, canvas_height=3, canvas_width=4))
+        logits = model(torch.tensor(batch["input_ids"]), visual_maps=torch.tensor(batch["visual_maps"]), event_positions=torch.tensor(batch["event_positions"]), event_counts=torch.tensor(batch["event_counts"]))
+        loss = target_cross_entropy(logits, torch.tensor(batch["labels"]))
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss).item())
+        self.assertIsNotNone(model.visual_memory.character_embedding.weight.grad)
+
     def test_full_text_forward_is_finite_and_visual_path_gets_gradients(self) -> None:
         example = PerStepExample(input="<MAP>ab\ncd</MAP>\n<ACT>left</ACT>", target="<POS>(0, 1)</POS>")
         batch = collate_visual_examples([example], context_length=64, canvas_height=3, canvas_width=4)
